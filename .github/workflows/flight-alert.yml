@@ -1,0 +1,273 @@
+name: flight-alert
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"   # 15分ごと（GitHub側の混雑で数分遅れることがあります）
+  workflow_dispatch:          # 手動実行ボタン
+
+permissions:
+  contents: write             # 記録ファイル state.json を保存するため
+
+concurrency:
+  group: flight-alert
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: プログラムを用意
+        run: |
+          cat > check_flights.py <<'PYEOF'
+          #!/usr/bin/env python3
+          """羽田・成田（東京 TYO）発の格安往復航空券を探して Discord に通知する。
+
+          GitHub Actions から定期実行する前提。外部ライブラリ不要（標準ライブラリのみ）。
+          必要な環境変数:
+            TRAVELPAYOUTS_TOKEN  … Travelpayouts の API トークン
+            DISCORD_WEBHOOK_URL  … 通知先の Discord Webhook URL
+          """
+          import json
+          import os
+          import sys
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          from datetime import datetime, timedelta, timezone
+
+          # ===== 設定（ここを変えれば条件を調整できます） =====
+          ORIGIN = "TYO"                 # 東京（羽田 HND + 成田 NRT）
+          MONTHS_AHEAD = 6               # 何か月先の出発まで探すか
+          DOMESTIC_MAX = int(os.getenv("DOMESTIC_MAX", "15000"))  # 国内線: 往復この金額以下なら通知
+          INTL_MAX = int(os.getenv("INTL_MAX", "40000"))          # 国際線: 往復この金額以下なら通知
+          DROP_RATE = 0.10               # 過去30日の最安値より10%以上安ければ通知
+          MAX_NOTIFY = 10                # 1回の実行で通知する最大件数
+          RENOTIFY_DAYS = 7              # 同じ便・同じ価格は7日間再通知しない
+          HISTORY_DAYS = 30              # 価格履歴を何日分保持するか
+          # ===================================================
+
+          API_URL = "https://api.travelpayouts.com/aviasales/v3/prices_for_dates"
+          DATA_URL = "https://api.travelpayouts.com/data/{lang}/{kind}.json"
+          STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
+          JST = timezone(timedelta(hours=9))
+
+
+          def http_get_json(url, headers=None, timeout=30):
+              req = urllib.request.Request(url, headers={"User-Agent": "flight-alert/1.0", **(headers or {})})
+              with urllib.request.urlopen(req, timeout=timeout) as res:
+                  return json.loads(res.read().decode("utf-8"))
+
+
+          def load_names():
+              """都市コード → (都市名, 国コード)、国コード → 国名 の辞書を作る。失敗してもコードのまま動く。"""
+              cities, countries = {}, {}
+              for lang in ("ja", "en"):
+                  try:
+                      for c in http_get_json(DATA_URL.format(lang=lang, kind="cities")):
+                          code = c.get("code")
+                          if code and code not in cities:
+                              cities[code] = (c.get("name") or code, c.get("country_code") or "")
+                      for c in http_get_json(DATA_URL.format(lang=lang, kind="countries")):
+                          code = c.get("code")
+                          if code and code not in countries:
+                              countries[code] = c.get("name") or code
+                      if cities:
+                          break
+                  except Exception as e:  # 名前データは無くても動作に支障なし
+                      print(f"[warn] 名前データ({lang})の取得に失敗: {e}")
+              return cities, countries
+
+
+          def fetch_prices(token):
+              """今月から MONTHS_AHEAD か月分、東京発・全行先・往復の価格を取得する。"""
+              results = []
+              today = datetime.now(JST).date()
+              y, m = today.year, today.month
+              for _ in range(MONTHS_AHEAD):
+                  params = {
+                      "origin": ORIGIN,
+                      "departure_at": f"{y:04d}-{m:02d}",
+                      "one_way": "false",
+                      "currency": "jpy",
+                      "market": "jp",
+                      "sorting": "price",
+                      "limit": "1000",
+                  }
+                  url = API_URL + "?" + urllib.parse.urlencode(params)
+                  data = http_get_json(url, headers={"X-Access-Token": token})
+                  if not data.get("success"):
+                      raise RuntimeError(f"API エラー: {data.get('error')}")
+                  results.extend(data.get("data") or [])
+                  m += 1
+                  if m > 12:
+                      y, m = y + 1, 1
+                  time.sleep(0.5)
+              return results
+
+
+          def load_state():
+              if os.path.exists(STATE_FILE):
+                  with open(STATE_FILE, encoding="utf-8") as f:
+                      return json.load(f)
+              return {}
+
+
+          def save_state(state):
+              with open(STATE_FILE, "w", encoding="utf-8") as f:
+                  json.dump(state, f, ensure_ascii=False, indent=1, sort_keys=True)
+                  f.write("\n")
+
+
+          def fmt_date(iso):
+              try:
+                  d = datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone(JST)
+                  return d.strftime("%m/%d(") + "月火水木金土日"[d.weekday()] + d.strftime(") %H:%M")
+              except Exception:
+                  return iso or "-"
+
+
+          def fmt_transfers(n):
+              return "直行" if not n else f"乗継{n}回"
+
+
+          def pick_deals(items, state, cities):
+              """通知すべき便を選ぶ。state も更新する。"""
+              now = datetime.now(JST)
+              today = now.date().isoformat()
+              history = state.setdefault("history", {})     # 行先 → {日付: その日の最安値}
+              notified = state.setdefault("notified", {})   # 通知済みキー → 通知日時
+
+              # 古い記録を掃除
+              cutoff = (now - timedelta(days=HISTORY_DAYS)).date().isoformat()
+              for dest in list(history):
+                  history[dest] = {d: p for d, p in history[dest].items() if d >= cutoff}
+                  if not history[dest]:
+                      del history[dest]
+              re_cut = (now - timedelta(days=RENOTIFY_DAYS)).isoformat()
+              for k in [k for k, t in notified.items() if t < re_cut]:
+                  del notified[k]
+
+              # 行先ごとの今回の最安便
+              best = {}
+              for it in items:
+                  dest, price = it.get("destination"), it.get("price")
+                  if not dest or not isinstance(price, (int, float)) or not it.get("return_at"):
+                      continue
+                  if dest not in best or price < best[dest]["price"]:
+                      best[dest] = it
+
+              deals = []
+              for dest, it in best.items():
+                  price = int(it["price"])
+                  past = [p for d, p in history.get(dest, {}).items() if d != today]
+                  past_min = min(past) if past else None
+                  country = cities.get(dest, ("", ""))[1]
+                  limit = DOMESTIC_MAX if country == "JP" else INTL_MAX
+
+                  reasons = []
+                  if past_min and price <= past_min * (1 - DROP_RATE):
+                      reasons.append(f"過去{HISTORY_DAYS}日の最安 ¥{past_min:,} から {round((1 - price / past_min) * 100)}% 値下がり")
+                  if price <= limit:
+                      reasons.append(f"{'国内' if country == 'JP' else '海外'}往復 ¥{limit:,} 以下")
+
+                  # 履歴を更新（その日の最安値を保持）
+                  day = history.setdefault(dest, {})
+                  day[today] = min(day.get(today, price), price)
+
+                  if not reasons:
+                      continue
+                  key = f"{dest}|{it.get('departure_at', '')[:10]}|{it.get('return_at', '')[:10]}|{price}"
+                  if key in notified:
+                      continue
+                  deals.append((price, key, it, reasons))
+
+              deals.sort(key=lambda x: x[0])
+              deals = deals[:MAX_NOTIFY]
+              for _, key, _, _ in deals:
+                  notified[key] = now.isoformat()
+              return [(it, reasons) for _, _, it, reasons in deals]
+
+
+          def build_embed(it, reasons, cities, countries):
+              dest = it["destination"]
+              city, cc = cities.get(dest, (dest, ""))
+              country = countries.get(cc, cc)
+              place = f"{city}（{country}）" if country and cc != "JP" else city
+              link = it.get("link") or ""
+              url = "https://www.aviasales.com" + link if link.startswith("/") else (link or None)
+              embed = {
+                  "title": f"✈️ 東京 → {place}　往復 ¥{int(it['price']):,}",
+                  "color": 0x2ECC71 if cc == "JP" else 0x3498DB,
+                  "fields": [
+                      {"name": "往路", "value": f"{fmt_date(it.get('departure_at'))}\n{it.get('origin_airport', '')}→{it.get('destination_airport', '')}・{fmt_transfers(it.get('transfers'))}", "inline": True},
+                      {"name": "復路", "value": f"{fmt_date(it.get('return_at'))}\n{fmt_transfers(it.get('return_transfers'))}", "inline": True},
+                      {"name": "航空会社", "value": f"{it.get('airline', '-')} {it.get('flight_number', '')}".strip(), "inline": True},
+                      {"name": "通知理由", "value": "\n".join(reasons), "inline": False},
+                  ],
+                  "footer": {"text": "価格はキャッシュ値です。予約前にリンク先で最新価格を確認してください。"},
+              }
+              if url:
+                  embed["url"] = url
+              return embed
+
+
+          def post_discord(webhook, payload):
+              body = json.dumps(payload).encode("utf-8")
+              req = urllib.request.Request(webhook, data=body, headers={"Content-Type": "application/json", "User-Agent": "flight-alert/1.0"})
+              for attempt in range(3):
+                  try:
+                      with urllib.request.urlopen(req, timeout=30):
+                          return
+                  except urllib.error.HTTPError as e:
+                      if e.code == 429 and attempt < 2:  # レート制限 → 待って再送
+                          time.sleep(float(e.headers.get("Retry-After", "2")))
+                          continue
+                      raise
+
+
+          def main():
+              token = os.environ.get("TRAVELPAYOUTS_TOKEN", "").strip()
+              webhook = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
+              if not token or not webhook:
+                  sys.exit("TRAVELPAYOUTS_TOKEN と DISCORD_WEBHOOK_URL を設定してください。")
+
+              state = load_state()
+              first_run = not state.get("started_at")
+
+              cities, countries = load_names()
+              items = fetch_prices(token)
+              print(f"取得件数: {len(items)}")
+              deals = pick_deals(items, state, cities)
+              print(f"通知件数: {len(deals)}")
+
+              if first_run:
+                  state["started_at"] = datetime.now(JST).isoformat()
+                  post_discord(webhook, {"content": f"🛫 航空券ウォッチを開始しました（東京発・往復・{len(items)}件のデータを取得）。"})
+
+              if deals:
+                  embeds = [build_embed(it, r, cities, countries) for it, r in deals]
+                  post_discord(webhook, {"content": f"格安往復航空券が {len(deals)} 件見つかりました。", "embeds": embeds})
+
+              save_state(state)
+
+
+          if __name__ == "__main__":
+              main()
+          PYEOF
+
+      - name: 航空券をチェック
+        run: python3 check_flights.py
+        env:
+          TRAVELPAYOUTS_TOKEN: ${{ secrets.TRAVELPAYOUTS_TOKEN }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+
+      - name: 記録を保存
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state.json
+          git diff --cached --quiet || (git commit -m "update state" && git push)
