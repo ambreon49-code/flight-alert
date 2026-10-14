@@ -42,8 +42,10 @@ jobs:
           # ===== 設定（ここを変えれば条件を調整できます） =====
           ORIGIN = "TYO"                 # 東京（羽田 HND + 成田 NRT）
           MONTHS_AHEAD = 6               # 何か月先の出発まで探すか
-          DOMESTIC_MAX = int(os.getenv("DOMESTIC_MAX", "15000"))  # 国内線: 往復この金額以下なら通知
-          INTL_MAX = int(os.getenv("INTL_MAX", "40000"))          # 国際線: 往復この金額以下なら通知
+          MARKET_RATE = 0.30             # 同じ行先の相場（中央値）より30%以上安ければ通知
+          MIN_SAMPLES = 5                # 相場を出すのに必要な最低データ件数
+          DOMESTIC_MAX = int(os.getenv("DOMESTIC_MAX", "0"))  # 国内線: 往復この金額以下なら通知（0 = 使わない）
+          INTL_MAX = int(os.getenv("INTL_MAX", "0"))          # 国際線: 往復この金額以下なら通知（0 = 使わない）
           DROP_RATE = 0.10               # 過去30日の最安値より10%以上安ければ通知
           MAX_NOTIFY = 10                # 1回の実行で通知する最大件数
           RENOTIFY_DAYS = 7              # 同じ便・同じ価格は7日間再通知しない
@@ -153,10 +155,12 @@ jobs:
 
               # 行先ごとの今回の最安便
               best = {}
+              prices = {}                                   # 行先 → 今回取得した全価格（相場計算用）
               for it in items:
                   dest, price = it.get("destination"), it.get("price")
                   if not dest or not isinstance(price, (int, float)) or not it.get("return_at"):
                       continue
+                  prices.setdefault(dest, []).append(price)
                   if dest not in best or price < best[dest]["price"]:
                       best[dest] = it
 
@@ -168,10 +172,15 @@ jobs:
                   country = cities.get(dest, ("", ""))[1]
                   limit = DOMESTIC_MAX if country == "JP" else INTL_MAX
 
+                  ps = sorted(prices[dest])
+                  market = int(ps[len(ps) // 2]) if len(ps) >= MIN_SAMPLES else None
+
                   reasons = []
+                  if market and price <= market * (1 - MARKET_RATE):
+                      reasons.append(f"相場 ¥{market:,}（{len(ps)}件の中央値）より {round((1 - price / market) * 100)}% 安い")
                   if past_min and price <= past_min * (1 - DROP_RATE):
                       reasons.append(f"過去{HISTORY_DAYS}日の最安 ¥{past_min:,} から {round((1 - price / past_min) * 100)}% 値下がり")
-                  if price <= limit:
+                  if limit and price <= limit:
                       reasons.append(f"{'国内' if country == 'JP' else '海外'}往復 ¥{limit:,} 以下")
 
                   # 履歴を更新（その日の最安値を保持）
