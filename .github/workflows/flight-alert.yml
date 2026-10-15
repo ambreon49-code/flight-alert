@@ -37,22 +37,39 @@ jobs:
           import urllib.error
           import urllib.parse
           import urllib.request
+          import xml.etree.ElementTree as ET
           from datetime import datetime, timedelta, timezone
 
           # ===== 設定（ここを変えれば条件を調整できます） =====
           ORIGIN = "TYO"                 # 東京（羽田 HND + 成田 NRT）
           MONTHS_AHEAD = 6               # 何か月先の出発まで探すか
-          MARKET_RATE = 0.30             # 同じ行先の相場（中央値）より30%以上安ければ通知
-          MIN_SAMPLES = 5                # 相場を出すのに必要な最低データ件数
-          DOMESTIC_MAX = int(os.getenv("DOMESTIC_MAX", "0"))  # 国内線: 往復この金額以下なら通知（0 = 使わない）
-          INTL_MAX = int(os.getenv("INTL_MAX", "0"))          # 国際線: 往復この金額以下なら通知（0 = 使わない）
-          DROP_RATE = 0.10               # 過去30日の最安値より10%以上安ければ通知
+          # 往復この金額以下なら通知（国コード別）。LCCの通常運賃ではなく、セール・エラー運賃の水準。
+          EUROPE = "GB FR DE IT ES PT NL BE AT CH CZ PL HU GR DK SE NO FI IE HR TR".split()
+          PRICE_CAPS = {
+              "JP": 8000,
+              "KR": 15000,
+              "TW": 20000, "HK": 20000, "MO": 20000,
+              "CN": 30000, "GU": 30000, "MP": 30000,
+              **{cc: 35000 for cc in "TH VN PH SG MY ID KH".split()},
+              "AU": 60000,
+              "US": 70000, "CA": 70000, "NZ": 70000,
+              **{cc: 75000 for cc in EUROPE},
+          }
+          HAWAII = {"HNL", "OGG", "KOA", "LIH", "ITO"}
+          HAWAII_CAP = 50000
+          BASELINE_RATE = 0.40           # 普段の最安値（過去30日の日別最安の中央値）より40%以上安ければ通知
+          BASELINE_MIN_DAYS = 7          # 普段の最安値を出すのに必要な日数
           MAX_NOTIFY = 10                # 1回の実行で通知する最大件数
-          RENOTIFY_DAYS = 7              # 同じ便・同じ価格は7日間再通知しない
+          RENOTIFY_DAYS = 7              # 同じ便は7日間再通知しない（さらに5%以上下がった場合を除く）
+          RENOTIFY_DROP = 0.05
           HISTORY_DAYS = 30              # 価格履歴を何日分保持するか
+          SALE_FEED = "https://www.traicy.com/category/sale/feed"  # トライシーの「セール・特別運賃」記事
+          SALE_NEED_PRICE = True         # 金額（○円）が書かれたセール記事だけ通知する
+          SALE_KEEP_DAYS = 60            # 通知済み記事を何日覚えておくか
           # ===================================================
 
           API_URL = "https://api.travelpayouts.com/aviasales/v3/prices_for_dates"
+          LATEST_URL = "https://api.travelpayouts.com/v2/prices/latest"
           DATA_URL = "https://api.travelpayouts.com/data/{lang}/{kind}.json"
           STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
           JST = timezone(timedelta(hours=9))
@@ -111,6 +128,57 @@ jobs:
               return results
 
 
+          def fetch_latest(token):
+              """直近48時間に Aviasales で検索された東京発・往復の価格を取得し、fetch_prices と同じ形に揃える。"""
+              params = {
+                  "origin": ORIGIN,
+                  "currency": "jpy",
+                  "period_type": "year",
+                  "one_way": "false",
+                  "show_to_affiliates": "false",   # 提携リンク経由以外の検索結果も含める
+                  "sorting": "price",
+                  "limit": "1000",
+              }
+              data = http_get_json(LATEST_URL + "?" + urllib.parse.urlencode(params), headers={"X-Access-Token": token})
+              if not data.get("success"):
+                  raise RuntimeError(f"API エラー: {data.get('error')}")
+              items = []
+              for d in data.get("data") or []:
+                  if d.get("trip_class") not in (0, None) or not d.get("return_date"):
+                      continue
+                  items.append({
+                      "destination": d.get("destination"),
+                      "price": d.get("value"),
+                      "departure_at": d.get("depart_date"),
+                      "return_at": d.get("return_date"),
+                      "transfers": d.get("number_of_changes"),
+                  })
+              return items
+
+
+          def fetch_sales(state):
+              """トライシーのセール記事 RSS から、まだ通知していない記事を返す。"""
+              req = urllib.request.Request(SALE_FEED, headers={"User-Agent": "Mozilla/5.0 (flight-alert/1.0)"})
+              with urllib.request.urlopen(req, timeout=30) as res:
+                  root = ET.fromstring(res.read())
+              now = datetime.now(JST)
+              first = "sales_seen" not in state
+              seen = state.setdefault("sales_seen", {})
+              cut = (now - timedelta(days=SALE_KEEP_DAYS)).isoformat()
+              for k in [k for k, t in seen.items() if t < cut]:
+                  del seen[k]
+              new = []
+              for item in root.iter("item"):
+                  title, link = (item.findtext("title") or "").strip(), (item.findtext("link") or "").strip()
+                  if not link or link in seen:
+                      continue
+                  seen[link] = now.isoformat()
+                  if first or (SALE_NEED_PRICE and "円" not in title):
+                      continue                                  # 初回は既存記事を既読にするだけ
+                  new.append({"title": title, "url": link})
+              return new
+
+
           def load_state():
               if os.path.exists(STATE_FILE):
                   with open(STATE_FILE, encoding="utf-8") as f:
@@ -126,6 +194,9 @@ jobs:
 
           def fmt_date(iso):
               try:
+                  if "T" not in iso:                         # 日付だけのデータ（時刻なし）
+                      d = datetime.fromisoformat(iso)
+                      return d.strftime("%m/%d(") + "月火水木金土日"[d.weekday()] + ")"
                   d = datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone(JST)
                   return d.strftime("%m/%d(") + "月火水木金土日"[d.weekday()] + d.strftime(") %H:%M")
               except Exception:
@@ -150,38 +221,38 @@ jobs:
                   if not history[dest]:
                       del history[dest]
               re_cut = (now - timedelta(days=RENOTIFY_DAYS)).isoformat()
-              for k in [k for k, t in notified.items() if t < re_cut]:
-                  del notified[k]
+              for k in list(notified):
+                  v = notified[k]
+                  if isinstance(v, str):                    # 旧形式「行先|往路|復路|価格」→ 新形式へ
+                      del notified[k]
+                      k2, _, p = k.rpartition("|")
+                      if v >= re_cut and (k2 not in notified or int(p) < notified[k2]["price"]):
+                          notified[k2] = {"at": v, "price": int(p)}
+                  elif v["at"] < re_cut:
+                      del notified[k]
 
               # 行先ごとの今回の最安便
               best = {}
-              prices = {}                                   # 行先 → 今回取得した全価格（相場計算用）
               for it in items:
                   dest, price = it.get("destination"), it.get("price")
                   if not dest or not isinstance(price, (int, float)) or not it.get("return_at"):
                       continue
-                  prices.setdefault(dest, []).append(price)
                   if dest not in best or price < best[dest]["price"]:
                       best[dest] = it
 
               deals = []
               for dest, it in best.items():
                   price = int(it["price"])
-                  past = [p for d, p in history.get(dest, {}).items() if d != today]
-                  past_min = min(past) if past else None
+                  past = sorted(p for d, p in history.get(dest, {}).items() if d != today)
+                  baseline = past[len(past) // 2] if len(past) >= BASELINE_MIN_DAYS else None
                   country = cities.get(dest, ("", ""))[1]
-                  limit = DOMESTIC_MAX if country == "JP" else INTL_MAX
-
-                  ps = sorted(prices[dest])
-                  market = int(ps[len(ps) // 2]) if len(ps) >= MIN_SAMPLES else None
+                  cap = HAWAII_CAP if dest in HAWAII else PRICE_CAPS.get(country, 0)
 
                   reasons = []
-                  if market and price <= market * (1 - MARKET_RATE):
-                      reasons.append(f"相場 ¥{market:,}（{len(ps)}件の中央値）より {round((1 - price / market) * 100)}% 安い")
-                  if past_min and price <= past_min * (1 - DROP_RATE):
-                      reasons.append(f"過去{HISTORY_DAYS}日の最安 ¥{past_min:,} から {round((1 - price / past_min) * 100)}% 値下がり")
-                  if limit and price <= limit:
-                      reasons.append(f"{'国内' if country == 'JP' else '海外'}往復 ¥{limit:,} 以下")
+                  if cap and price <= cap:
+                      reasons.append(f"往復 ¥{cap:,} 以下（この地域の激安ライン）")
+                  if baseline and price <= baseline * (1 - BASELINE_RATE):
+                      reasons.append(f"普段の最安 ¥{baseline:,}（過去{len(past)}日の中央値）より {round((1 - price / baseline) * 100)}% 安い")
 
                   # 履歴を更新（その日の最安値を保持）
                   day = history.setdefault(dest, {})
@@ -189,15 +260,15 @@ jobs:
 
                   if not reasons:
                       continue
-                  key = f"{dest}|{it.get('departure_at', '')[:10]}|{it.get('return_at', '')[:10]}|{price}"
-                  if key in notified:
+                  key = f"{dest}|{it.get('departure_at', '')[:10]}|{it.get('return_at', '')[:10]}"
+                  if key in notified and price > notified[key]["price"] * (1 - RENOTIFY_DROP):
                       continue
                   deals.append((price, key, it, reasons))
 
               deals.sort(key=lambda x: x[0])
               deals = deals[:MAX_NOTIFY]
-              for _, key, _, _ in deals:
-                  notified[key] = now.isoformat()
+              for price, key, _, _ in deals:
+                  notified[key] = {"at": now.isoformat(), "price": price}
               return [(it, reasons) for _, _, it, reasons in deals]
 
 
@@ -207,12 +278,16 @@ jobs:
               country = countries.get(cc, cc)
               place = f"{city}（{country}）" if country and cc != "JP" else city
               link = it.get("link") or ""
-              url = "https://www.aviasales.com" + link if link.startswith("/") else (link or None)
+              if link.startswith("/"):
+                  url = "https://www.aviasales.com" + link
+              else:                                          # リンクが無いデータは検索結果ページを開く
+                  dep, ret = it.get("departure_at", "")[:10], it.get("return_at", "")[:10]
+                  url = f"https://www.aviasales.com/search/{ORIGIN}{dep[8:10]}{dep[5:7]}{dest}{ret[8:10]}{ret[5:7]}1" if dep and ret else None
               embed = {
                   "title": f"✈️ 東京 → {place}　往復 ¥{int(it['price']):,}",
                   "color": 0x2ECC71 if cc == "JP" else 0x3498DB,
                   "fields": [
-                      {"name": "往路", "value": f"{fmt_date(it.get('departure_at'))}\n{it.get('origin_airport', '')}→{it.get('destination_airport', '')}・{fmt_transfers(it.get('transfers'))}", "inline": True},
+                      {"name": "往路", "value": f"{fmt_date(it.get('departure_at'))}\n{it.get('origin_airport', '') + '→' + it.get('destination_airport', '') + '・' if it.get('origin_airport') else ''}{fmt_transfers(it.get('transfers'))}", "inline": True},
                       {"name": "復路", "value": f"{fmt_date(it.get('return_at'))}\n{fmt_transfers(it.get('return_transfers'))}", "inline": True},
                       {"name": "航空会社", "value": f"{it.get('airline', '-')} {it.get('flight_number', '')}".strip(), "inline": True},
                       {"name": "通知理由", "value": "\n".join(reasons), "inline": False},
@@ -249,7 +324,13 @@ jobs:
 
               cities, countries = load_names()
               items = fetch_prices(token)
-              print(f"取得件数: {len(items)}")
+              print(f"取得件数（日付別）: {len(items)}")
+              try:
+                  latest = fetch_latest(token)
+                  print(f"取得件数（直近48時間）: {len(latest)}")
+                  items.extend(latest)
+              except Exception as e:                        # 追加データなので失敗しても続行
+                  print(f"[warn] 直近48時間の価格の取得に失敗: {e}")
               deals = pick_deals(items, state, cities)
               print(f"通知件数: {len(deals)}")
 
@@ -260,6 +341,15 @@ jobs:
               if deals:
                   embeds = [build_embed(it, r, cities, countries) for it, r in deals]
                   post_discord(webhook, {"content": f"格安往復航空券が {len(deals)} 件見つかりました。", "embeds": embeds})
+
+              try:
+                  sales = fetch_sales(state)
+                  print(f"新着セール記事: {len(sales)}")
+                  if sales:
+                      embeds = [{"title": f"🏷️ {s['title']}"[:256], "url": s["url"], "color": 0xE67E22} for s in sales[:10]]
+                      post_discord(webhook, {"content": f"航空会社のセール情報が {len(sales)} 件あります（トライシー）。", "embeds": embeds})
+              except Exception as e:
+                  print(f"[warn] セール記事の取得に失敗: {e}")
 
               save_state(state)
 
