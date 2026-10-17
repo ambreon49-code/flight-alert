@@ -15,7 +15,7 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10       # 地方発・片道も取るので API 呼び出しが約100回
     steps:
       - uses: actions/checkout@v4
 
@@ -41,7 +41,10 @@ jobs:
           from datetime import datetime, timedelta, timezone
 
           # ===== 設定（ここを変えれば条件を調整できます） =====
-          ORIGIN = "TYO"                 # 東京（羽田 HND + 成田 NRT）
+          ORIGIN = "TYO"                 # 東京（羽田 HND + 成田 NRT）。金額は東京から出発する前提で比べる
+          # 地方発も探す。判定は「東京→その空港の国内線（最安）＋その空港発の運賃」の合計で行う。
+          REGIONAL = "SPK AKJ NGO OSA FUK OKA".split()  # 札幌・旭川・名古屋・大阪・福岡・沖縄
+          ONE_WAY_RATE = 0.6             # 片道の激安ライン = 往復のライン × この割合
           MONTHS_AHEAD = 6               # 何か月先の出発まで探すか
           # 往復この金額以下なら通知（国コード別）。LCCの通常運賃ではなく、セール・エラー運賃の水準。
           EUROPE = "GB FR DE IT ES PT NL BE AT CH CZ PL HU GR DK SE NO FI IE HR TR".split()
@@ -101,16 +104,16 @@ jobs:
               return cities, countries
 
 
-          def fetch_prices(token):
-              """今月から MONTHS_AHEAD か月分、東京発・全行先・往復の価格を取得する。"""
+          def fetch_prices(token, origin, one_way):
+              """今月から MONTHS_AHEAD か月分、origin 発・全行先の往復（one_way なら片道）の価格を取得する。"""
               results = []
               today = datetime.now(JST).date()
               y, m = today.year, today.month
               for _ in range(MONTHS_AHEAD):
                   params = {
-                      "origin": ORIGIN,
+                      "origin": origin,
                       "departure_at": f"{y:04d}-{m:02d}",
-                      "one_way": "false",
+                      "one_way": "true" if one_way else "false",
                       "currency": "jpy",
                       "market": "jp",
                       "sorting": "price",
@@ -120,7 +123,9 @@ jobs:
                   data = http_get_json(url, headers={"X-Access-Token": token})
                   if not data.get("success"):
                       raise RuntimeError(f"API エラー: {data.get('error')}")
-                  results.extend(data.get("data") or [])
+                  for it in data.get("data") or []:
+                      it["_origin"], it["_ow"] = origin, one_way
+                      results.append(it)
                   m += 1
                   if m > 12:
                       y, m = y + 1, 1
@@ -128,13 +133,13 @@ jobs:
               return results
 
 
-          def fetch_latest(token):
-              """直近48時間に Aviasales で検索された東京発・往復の価格を取得し、fetch_prices と同じ形に揃える。"""
+          def fetch_latest(token, origin, one_way):
+              """直近48時間に Aviasales で検索された origin 発の価格を取得し、fetch_prices と同じ形に揃える。"""
               params = {
-                  "origin": ORIGIN,
+                  "origin": origin,
                   "currency": "jpy",
                   "period_type": "year",
-                  "one_way": "false",
+                  "one_way": "true" if one_way else "false",
                   "show_to_affiliates": "false",   # 提携リンク経由以外の検索結果も含める
                   "sorting": "price",
                   "limit": "1000",
@@ -144,7 +149,7 @@ jobs:
                   raise RuntimeError(f"API エラー: {data.get('error')}")
               items = []
               for d in data.get("data") or []:
-                  if d.get("trip_class") not in (0, None) or not d.get("return_date"):
+                  if d.get("trip_class") not in (0, None) or bool(d.get("return_date")) == one_way:
                       continue
                   items.append({
                       "destination": d.get("destination"),
@@ -152,6 +157,8 @@ jobs:
                       "departure_at": d.get("depart_date"),
                       "return_at": d.get("return_date"),
                       "transfers": d.get("number_of_changes"),
+                      "_origin": origin,
+                      "_ow": one_way,
                   })
               return items
 
@@ -231,36 +238,56 @@ jobs:
                   elif v["at"] < re_cut:
                       del notified[k]
 
-              # 行先ごとの今回の最安便
+              # 出発地・行先・片道/往復ごとの今回の最安便
               best = {}
               for it in items:
                   dest, price = it.get("destination"), it.get("price")
-                  if not dest or not isinstance(price, (int, float)) or not it.get("return_at"):
+                  origin, ow = it.get("_origin", ORIGIN), it.get("_ow", False)
+                  if not dest or not isinstance(price, (int, float)) or bool(it.get("return_at")) == ow:
                       continue
-                  if dest not in best or price < best[dest]["price"]:
-                      best[dest] = it
+                  k = (origin, dest, ow)
+                  if k not in best or price < best[k]["price"]:
+                      best[k] = it
+
+              # 東京→地方の空港までの移動費（東京発データのその都市行き最安。往復なら往復分）
+              positioning = {(dest, ow): int(it["price"]) for (o, dest, ow), it in best.items() if o == ORIGIN and dest in REGIONAL}
 
               deals = []
-              for dest, it in best.items():
-                  price = int(it["price"])
-                  past = sorted(p for d, p in history.get(dest, {}).items() if d != today)
-                  baseline = past[len(past) // 2] if len(past) >= BASELINE_MIN_DAYS else None
+              for (origin, dest, ow), it in best.items():
                   country = cities.get(dest, ("", ""))[1]
+                  extra = 0
+                  if origin != ORIGIN:
+                      if country == "JP" or (origin, ow) not in positioning:
+                          continue                              # 地方発の国内線、移動費が分からない便は対象外
+                      extra = positioning[(origin, ow)]
+                  fare = int(it["price"])
+                  price = fare + extra
+                  it["_fare"], it["_extra"], it["price"] = fare, extra, price
+                  # 履歴のキー（東京発・往復は従来どおり行先コードのみ）
+                  hkey = dest if origin == ORIGIN and not ow else f"{origin}-{dest}" + (":OW" if ow else "")
+                  past = sorted(p for d, p in history.get(hkey, {}).items() if d != today)
+                  baseline = past[len(past) // 2] if len(past) >= BASELINE_MIN_DAYS else None
                   cap = HAWAII_CAP if dest in HAWAII else PRICE_CAPS.get(country, 0)
+                  if ow:
+                      cap = int(cap * ONE_WAY_RATE)
 
+                  kind = "片道" if ow else "往復"
                   reasons = []
                   if cap and price <= cap:
-                      reasons.append(f"往復 ¥{cap:,} 以下（この地域の激安ライン）")
+                      reasons.append(f"{kind} ¥{cap:,} 以下（この地域の激安ライン）")
                   if baseline and price <= baseline * (1 - BASELINE_RATE):
                       reasons.append(f"普段の最安 ¥{baseline:,}（過去{len(past)}日の中央値）より {round((1 - price / baseline) * 100)}% 安い")
+                  tyo = best.get((ORIGIN, dest, ow))
+                  if reasons and origin != ORIGIN and tyo and price < tyo["price"]:
+                      reasons.append(f"東京発の最安 ¥{int(tyo['price']):,} より ¥{int(tyo['price']) - price:,} 安い")
 
                   # 履歴を更新（その日の最安値を保持）
-                  day = history.setdefault(dest, {})
+                  day = history.setdefault(hkey, {})
                   day[today] = min(day.get(today, price), price)
 
                   if not reasons:
                       continue
-                  key = f"{dest}|{it.get('departure_at', '')[:10]}|{it.get('return_at', '')[:10]}"
+                  key = f"{hkey}|{it.get('departure_at', '')[:10]}|{(it.get('return_at') or '')[:10]}"
                   if key in notified and price > notified[key]["price"] * (1 - RENOTIFY_DROP):
                       continue
                   deals.append((price, key, it, reasons))
@@ -277,21 +304,32 @@ jobs:
               city, cc = cities.get(dest, (dest, ""))
               country = countries.get(cc, cc)
               place = f"{city}（{country}）" if country and cc != "JP" else city
+              origin, ow = it.get("_origin", ORIGIN), it.get("_ow", False)
+              kind = "片道" if ow else "往復"
               link = it.get("link") or ""
               if link.startswith("/"):
                   url = "https://www.aviasales.com" + link
               else:                                          # リンクが無いデータは検索結果ページを開く
-                  dep, ret = it.get("departure_at", "")[:10], it.get("return_at", "")[:10]
-                  url = f"https://www.aviasales.com/search/{ORIGIN}{dep[8:10]}{dep[5:7]}{dest}{ret[8:10]}{ret[5:7]}1" if dep and ret else None
+                  dep, ret = (it.get("departure_at") or "")[:10], (it.get("return_at") or "")[:10]
+                  back = "" if ow else f"{ret[8:10]}{ret[5:7]}"
+                  url = f"https://www.aviasales.com/search/{origin}{dep[8:10]}{dep[5:7]}{dest}{back}1" if dep and (ow or ret) else None
+              fields = [
+                  {"name": "往路", "value": f"{fmt_date(it.get('departure_at'))}\n{it.get('origin_airport', '') + '→' + it.get('destination_airport', '') + '・' if it.get('origin_airport') else ''}{fmt_transfers(it.get('transfers'))}", "inline": True},
+              ]
+              if not ow:
+                  fields.append({"name": "復路", "value": f"{fmt_date(it.get('return_at'))}\n{fmt_transfers(it.get('return_transfers'))}", "inline": True})
+              fields.append({"name": "航空会社", "value": f"{it.get('airline', '-')} {it.get('flight_number', '')}".strip(), "inline": True})
+              if origin == ORIGIN:
+                  title = f"✈️ 東京 → {place}　{kind} ¥{int(it['price']):,}"
+              else:
+                  oname = cities.get(origin, (origin, ""))[0]
+                  title = f"✈️ {oname}発 → {place}　{kind} 合計 ¥{int(it['price']):,}"
+                  fields.append({"name": "内訳", "value": f"東京→{oname}（{kind}・国内線の最安目安） ¥{it['_extra']:,}\n{oname}発の運賃 ¥{it['_fare']:,}\n※国内線は別に予約。日付が合う便か確認してください", "inline": False})
+              fields.append({"name": "通知理由", "value": "\n".join(reasons), "inline": False})
               embed = {
-                  "title": f"✈️ 東京 → {place}　往復 ¥{int(it['price']):,}",
-                  "color": 0x2ECC71 if cc == "JP" else 0x3498DB,
-                  "fields": [
-                      {"name": "往路", "value": f"{fmt_date(it.get('departure_at'))}\n{it.get('origin_airport', '') + '→' + it.get('destination_airport', '') + '・' if it.get('origin_airport') else ''}{fmt_transfers(it.get('transfers'))}", "inline": True},
-                      {"name": "復路", "value": f"{fmt_date(it.get('return_at'))}\n{fmt_transfers(it.get('return_transfers'))}", "inline": True},
-                      {"name": "航空会社", "value": f"{it.get('airline', '-')} {it.get('flight_number', '')}".strip(), "inline": True},
-                      {"name": "通知理由", "value": "\n".join(reasons), "inline": False},
-                  ],
+                  "title": title[:256],
+                  "color": 0x2ECC71 if cc == "JP" else (0x9B59B6 if origin != ORIGIN else 0x3498DB),
+                  "fields": fields,
                   "footer": {"text": "価格はキャッシュ値です。予約前にリンク先で最新価格を確認してください。"},
               }
               if url:
@@ -323,14 +361,24 @@ jobs:
               first_run = not state.get("started_at")
 
               cities, countries = load_names()
-              items = fetch_prices(token)
-              print(f"取得件数（日付別）: {len(items)}")
-              try:
-                  latest = fetch_latest(token)
-                  print(f"取得件数（直近48時間）: {len(latest)}")
-                  items.extend(latest)
-              except Exception as e:                        # 追加データなので失敗しても続行
-                  print(f"[warn] 直近48時間の価格の取得に失敗: {e}")
+              items = []
+              for origin in [ORIGIN] + REGIONAL:
+                  for one_way in (False, True):
+                      label = f"{origin}・{'片道' if one_way else '往復'}"
+                      try:
+                          got = fetch_prices(token, origin, one_way)
+                          print(f"取得件数（日付別 {label}）: {len(got)}")
+                          items.extend(got)
+                      except Exception as e:
+                          if origin == ORIGIN and not one_way:
+                              raise                         # 本体のデータが取れないときは失敗にする
+                          print(f"[warn] {label} の価格の取得に失敗: {e}")
+                      try:
+                          latest = fetch_latest(token, origin, one_way)
+                          print(f"取得件数（直近48時間 {label}）: {len(latest)}")
+                          items.extend(latest)
+                      except Exception as e:                # 追加データなので失敗しても続行
+                          print(f"[warn] 直近48時間の価格（{label}）の取得に失敗: {e}")
               deals = pick_deals(items, state, cities)
               print(f"通知件数: {len(deals)}")
 
