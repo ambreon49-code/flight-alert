@@ -31,6 +31,7 @@ jobs:
             DISCORD_WEBHOOK_URL  … 通知先の Discord Webhook URL
           """
           import json
+          import re
           import os
           import sys
           import time
@@ -69,6 +70,11 @@ jobs:
           SALE_FEED = "https://www.traicy.com/category/sale/feed"  # トライシーの「セール・特別運賃」記事
           SALE_NEED_PRICE = True         # 金額（○円）が書かれたセール記事だけ通知する
           SALE_KEEP_DAYS = 60            # 通知済み記事を何日覚えておくか
+          # 海外のエラー運賃・激安情報（Travel-Dealz）。日本発の記事だけ通知する
+          DEAL_FEED = "https://travel-dealz.com/category/flights/feed/"
+          JP_PLACES = r"(Tokyo|Haneda|Narita|Japan|Osaka|Kansai|Nagoya|Fukuoka|Sapporo|Okinawa|Naha)"
+          DEAL_JP_RE = re.compile(rf"\b(from|ex)\s+{JP_PLACES}\b|\b{JP_PLACES}\b[^:]*↔|↔\s*{JP_PLACES}\b", re.I)  # 「from Tokyo」「Tokyo ↔ ○○」
+          DEAL_HOT_RE = re.compile(r"error fare|mistake fare|glitch|\bbug\b", re.I)  # これが付いていたら目印を付ける
           # ===================================================
 
           API_URL = "https://api.travelpayouts.com/aviasales/v3/prices_for_dates"
@@ -163,14 +169,14 @@ jobs:
               return items
 
 
-          def fetch_sales(state):
-              """トライシーのセール記事 RSS から、まだ通知していない記事を返す。"""
-              req = urllib.request.Request(SALE_FEED, headers={"User-Agent": "Mozilla/5.0 (flight-alert/1.0)"})
+          def fetch_sales(state, feed=SALE_FEED, key="sales_seen", keep=None):
+              """RSS から、まだ通知していない記事を返す。keep(title) が False の記事は捨てる。"""
+              req = urllib.request.Request(feed, headers={"User-Agent": "Mozilla/5.0 (flight-alert/1.0)"})
               with urllib.request.urlopen(req, timeout=30) as res:
                   root = ET.fromstring(res.read())
               now = datetime.now(JST)
-              first = "sales_seen" not in state
-              seen = state.setdefault("sales_seen", {})
+              first = key not in state
+              seen = state.setdefault(key, {})
               cut = (now - timedelta(days=SALE_KEEP_DAYS)).isoformat()
               for k in [k for k, t in seen.items() if t < cut]:
                   del seen[k]
@@ -180,8 +186,12 @@ jobs:
                   if not link or link in seen:
                       continue
                   seen[link] = now.isoformat()
-                  if first or (SALE_NEED_PRICE and "円" not in title):
+                  if first:
                       continue                                  # 初回は既存記事を既読にするだけ
+                  if keep is None and SALE_NEED_PRICE and "円" not in title:
+                      continue
+                  if keep is not None and not keep(title):
+                      continue
                   new.append({"title": title, "url": link})
               return new
 
@@ -398,6 +408,21 @@ jobs:
                       post_discord(webhook, {"content": f"航空会社のセール情報が {len(sales)} 件あります（トライシー）。", "embeds": embeds})
               except Exception as e:
                   print(f"[warn] セール記事の取得に失敗: {e}")
+
+              try:
+                  import html
+                  deals_jp = fetch_sales(state, DEAL_FEED, "deals_seen", lambda t: bool(DEAL_JP_RE.search(html.unescape(t))) and "cruise" not in t.lower())
+                  print(f"新着・日本発の激安/エラー運賃記事: {len(deals_jp)}")
+                  if deals_jp:
+                      embeds = []
+                      for d in deals_jp[:10]:
+                          t = html.unescape(d["title"])
+                          hot = bool(DEAL_HOT_RE.search(t))
+                          embeds.append({"title": f"{'🚨 エラー運賃 ' if hot else '💸 '}{t}"[:256], "url": d["url"], "color": 0xE74C3C if hot else 0xF1C40F,
+                                         "footer": {"text": "海外サイトの記事（ユーロ表記）。エラー運賃はすぐ消えるので早めに確認を。"}})
+                      post_discord(webhook, {"content": f"日本発の激安・エラー運賃情報が {len(deals_jp)} 件あります（Travel-Dealz）。", "embeds": embeds})
+              except Exception as e:
+                  print(f"[warn] 激安運賃記事の取得に失敗: {e}")
 
               save_state(state)
 
