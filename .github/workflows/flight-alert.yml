@@ -15,7 +15,7 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 10       # 地方発・片道も取るので API 呼び出しが約100回
+    timeout-minutes: 15       # API 呼び出し約100回 ＋ Google Flights の確認が最大40回
     steps:
       - uses: actions/checkout@v4
 
@@ -30,6 +30,7 @@ jobs:
             TRAVELPAYOUTS_TOKEN  … Travelpayouts の API トークン
             DISCORD_WEBHOOK_URL  … 通知先の Discord Webhook URL
           """
+          import base64
           import json
           import re
           import os
@@ -67,6 +68,13 @@ jobs:
           RENOTIFY_DAYS = 7              # 同じ便は7日間再通知しない（さらに5%以上下がった場合を除く）
           RENOTIFY_DROP = 0.05
           HISTORY_DAYS = 30              # 価格履歴を何日分保持するか
+          # Google Flights でも同じ日付の価格を調べ、安い方で判定・通知する（Aviasales は旅行サイトの手数料込みや古い価格が多い）
+          GF_ENABLED = True
+          GF_MARGIN = 1.3                # Aviasales の価格が通知ラインの何倍までなら Google Flights で調べるか（少し高い便も Google では届くことがある）
+          GF_TOP_DATES = 3               # 行先ごとに、安い日付を上から何件調べるか
+          GF_MAX_FETCH = 40              # 1回の実行で Google Flights を開く最大回数（1回 約2秒）
+          GF_CACHE_HOURS = 6             # 同じ便・同じ日付を調べ直すまでの時間
+          GF_STALE_RATE = 1.3            # Google Flights がこの倍率より高ければ「Aviasales の価格は古いかも」と注意を付ける
           SALE_FEED = "https://www.traicy.com/category/sale/feed"  # トライシーの「セール・特別運賃」記事
           SALE_NEED_PRICE = True         # 金額（○円）が書かれたセール記事だけ通知する
           SALE_KEEP_DAYS = 60            # 通知済み記事を何日覚えておくか
@@ -169,6 +177,99 @@ jobs:
               return items
 
 
+          GF_URL = "https://www.google.com/travel/flights"
+          GF_HEADERS = {
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36",
+              "Accept-Language": "ja,en;q=0.8",
+              # 同意画面を飛ばす（ヨーロッパの IP から実行されたとき用）
+              "Cookie": "SOCS=CAISNQgQEitib3FfaWRlbnRpdHlmcm9udGVuZHVpc2VydmVyXzIwMjQwMzE3LjA5X3AwGgJlbiADGgYIgLC_rwY",
+          }
+
+
+          def _varint(n):
+              out = b""
+              while True:
+                  b, n = n & 0x7F, n >> 7
+                  out += bytes([b | (0x80 if n else 0)])
+                  if not n:
+                      return out
+
+
+          def _pb_bytes(num, payload):
+              if isinstance(payload, str):
+                  payload = payload.encode()
+              return _varint(num << 3 | 2) + _varint(len(payload)) + payload
+
+
+          def _pb_int(num, n):
+              return _varint(num << 3) + _varint(n)
+
+
+          def gf_url(origin, dest, dep, ret=None):
+              """Google Flights の検索結果ページの URL（origin/dest は TYO・SEL のような都市コードでよい）。"""
+              def seg(date, a, b):
+                  return _pb_bytes(3, _pb_bytes(2, date) + _pb_bytes(13, _pb_int(1, 1) + _pb_bytes(2, a)) + _pb_bytes(14, _pb_int(1, 1) + _pb_bytes(2, b)))
+              body = seg(dep, origin, dest) + (seg(ret, dest, origin) if ret else b"")
+              body += _pb_int(8, 1) + _pb_int(9, 1) + _pb_int(19, 1 if ret else 2)   # 大人1・エコノミー・往復/片道
+              return f"{GF_URL}?tfs={base64.urlsafe_b64encode(body).decode().rstrip('=')}&hl=ja&gl=JP&curr=JPY"
+
+
+          def gf_search(origin, dest, dep, ret=None):
+              """Google Flights でその日付の最安便を調べる。便が無ければ price は None。ページが読めなければ例外。"""
+              req = urllib.request.Request(gf_url(origin, dest, dep, ret), headers=GF_HEADERS)
+              with urllib.request.urlopen(req, timeout=30) as res:
+                  page = res.read().decode("utf-8", "replace")
+              data = None
+              for m in re.finditer(r"AF_initDataCallback\((\{.*?\})\);", page, re.S):   # 検索結果はページ内の ds:1 に入っている
+                  if re.search(r"key:\s*'ds:1'", m.group(1)):
+                      d = re.search(r"data:(.*?), sideChannel", m.group(1), re.S)
+                      data = json.loads(d.group(1)) if d else None
+                      break
+              if not isinstance(data, list):
+                  raise RuntimeError("検索結果の入っていないページが返ってきた")
+              out = {"price": None}
+              for idx in (2, 3):                                     # 2 = おすすめの便、3 = その他の便
+                  try:
+                      rows = data[idx][0] or []
+                  except (IndexError, TypeError):
+                      continue
+                  for row in rows:
+                      try:
+                          price, legs = row[1][0][-1], row[0][2]
+                          if isinstance(price, bool) or not isinstance(price, (int, float)) or price <= 0:
+                              continue
+                          if out["price"] is None or price < out["price"]:
+                              t = list(legs[0][8] or []) + [0, 0]
+                              out.update(price=int(price), air=f"{legs[0][22][0]}{legs[0][22][1]}", src=legs[0][3], dst=legs[-1][6],
+                                         stops=len(legs) - 1, time=f"{t[0] or 0:02d}:{t[1] or 0:02d}")
+                      except (IndexError, TypeError):
+                          continue
+              try:                                                   # Google が出している「この路線の通常の価格帯」
+                  out["low"], out["high"] = int(data[5][4][1]), int(data[5][5][1])
+              except (IndexError, TypeError, ValueError):
+                  pass
+              return out
+
+
+          def gf_fill(cache, wanted, now):
+              """wanted = {(出発地, 行先, 往路日, 復路日): 優先度} を、通知ラインに近い順に Google Flights で調べて cache に入れる。"""
+              todo = sorted((pri, k) for k, pri in wanted.items() if "|".join(k) not in cache)
+              done = fails = 0
+              for _, k in todo:
+                  if done >= GF_MAX_FETCH or fails >= 3:             # 3回続けて失敗したら、今回はあきらめる（Aviasales の価格だけで続行）
+                      break
+                  origin, dest, dep, ret = k
+                  done += 1
+                  try:
+                      cache["|".join(k)] = {"at": now.isoformat(), **gf_search(origin, dest, dep, ret or None)}
+                      fails = 0
+                  except Exception as e:
+                      fails += 1
+                      print(f"[warn] Google Flights（{origin}→{dest} {dep}）の取得に失敗: {e}")
+                  time.sleep(1)
+              print(f"Google Flights で確認: 候補 {len(wanted)} 件 / 今回調べた {done} 件 / 次回に回す {len(todo) - done} 件")
+
+
           def fetch_sales(state, feed=SALE_FEED, key="sales_seen", keep=None):
               """RSS から、まだ通知していない記事を返す。keep(title) が False の記事は捨てる。"""
               req = urllib.request.Request(feed, headers={"User-Agent": "Mozilla/5.0 (flight-alert/1.0)"})
@@ -248,31 +349,37 @@ jobs:
                   elif v["at"] < re_cut:
                       del notified[k]
 
-              # 出発地・行先・片道/往復ごとの今回の最安便
-              best = {}
+              gf_cache = state.setdefault("gf", {})          # Google Flights で調べた結果（出発地|行先|往路日|復路日 → 価格など）
+              gf_cut = (now - timedelta(hours=GF_CACHE_HOURS)).isoformat()
+              for k in [k for k, v in gf_cache.items() if v["at"] < gf_cut]:
+                  del gf_cache[k]
+
+              # 出発地・行先・片道/往復ごとに、日付別の最安便を安い順に並べる（先頭が今回の最安便）
+              groups = {}
               for it in items:
                   dest, price = it.get("destination"), it.get("price")
                   origin, ow = it.get("_origin", ORIGIN), it.get("_ow", False)
                   if not dest or not isinstance(price, (int, float)) or bool(it.get("return_at")) == ow:
                       continue
-                  k = (origin, dest, ow)
-                  if k not in best or price < best[k]["price"]:
-                      best[k] = it
+                  dates = ((it.get("departure_at") or "")[:10], (it.get("return_at") or "")[:10])
+                  g = groups.setdefault((origin, dest, ow), {})
+                  if dates not in g or price < g[dates]["price"]:
+                      g[dates] = it
+              groups = {k: sorted(g.values(), key=lambda it: it["price"]) for k, g in groups.items()}
+              best = {k: g[0] for k, g in groups.items()}
 
               # 東京→地方の空港までの移動費（東京発データのその都市行き最安。往復なら往復分）
               positioning = {(dest, ow): int(it["price"]) for (o, dest, ow), it in best.items() if o == ORIGIN and dest in REGIONAL}
 
-              deals = []
-              for (origin, dest, ow), it in best.items():
+              # 1) 行先ごとの通知ラインを出し、Google Flights でも調べる便を集める
+              plans, wanted = [], {}
+              for (origin, dest, ow), group in groups.items():
                   country = cities.get(dest, ("", ""))[1]
                   extra = 0
                   if origin != ORIGIN:
                       if country == "JP" or (origin, ow) not in positioning:
                           continue                              # 地方発の国内線、移動費が分からない便は対象外
                       extra = positioning[(origin, ow)]
-                  fare = int(it["price"])
-                  price = fare + extra
-                  it["_fare"], it["_extra"], it["price"] = fare, extra, price
                   # 履歴のキー（東京発・往復は従来どおり行先コードのみ）
                   hkey = dest if origin == ORIGIN and not ow else f"{origin}-{dest}" + (":OW" if ow else "")
                   past = sorted(p for d, p in history.get(hkey, {}).items() if d != today)
@@ -280,6 +387,35 @@ jobs:
                   cap = HAWAII_CAP if dest in HAWAII else PRICE_CAPS.get(country, 0)
                   if ow:
                       cap = int(cap * ONE_WAY_RATE)
+                  line = max(cap, baseline * (1 - BASELINE_RATE) if baseline else 0)   # この金額以下なら通知になる
+                  cands = []
+                  if GF_ENABLED and line:
+                      for it in group[:GF_TOP_DATES]:
+                          dep, ret = (it.get("departure_at") or "")[:10], (it.get("return_at") or "")[:10]
+                          if dep and int(it["price"]) + extra <= line * GF_MARGIN:
+                              k = (origin, dest, dep, ret)
+                              cands.append((it, "|".join(k)))
+                              wanted[k] = min(wanted.get(k, 9), (int(it["price"]) + extra) / line)
+                  plans.append((origin, dest, ow, group, extra, hkey, past, baseline, cap, cands))
+              if wanted:
+                  gf_fill(gf_cache, wanted, now)
+
+              # 2) Aviasales と Google Flights の安い方で判定する
+              deals = []
+              for origin, dest, ow, group, extra, hkey, past, baseline, cap, cands in plans:
+                  it, gf = group[0], None
+                  fare = int(it["price"])
+                  for cand, gkey in cands:
+                      g = gf_cache.get(gkey)
+                      if not g:
+                          continue                              # まだ調べられていない
+                      f = min(int(cand["price"]), g["price"]) if g["price"] else int(cand["price"])
+                      if gf is None or f < fare:                # 調べた便を優先し、その中でいちばん安い日付を選ぶ
+                          it, gf, fare = cand, g, f
+                  it = dict(it)
+                  price = fare + extra
+                  it["_avia"], it["_gf"] = int(it["price"]), gf
+                  it["_fare"], it["_extra"], it["price"] = fare, extra, price
 
                   kind = "片道" if ow else "往復"
                   reasons = []
@@ -290,6 +426,8 @@ jobs:
                   tyo = best.get((ORIGIN, dest, ow))
                   if reasons and origin != ORIGIN and tyo and price < tyo["price"]:
                       reasons.append(f"東京発の最安 ¥{int(tyo['price']):,} より ¥{int(tyo['price']) - price:,} 安い")
+                  if reasons and gf and gf.get("low") and gf["price"] and gf["price"] < gf["low"]:   # Google 自身の価格が安いときだけ
+                      reasons.append(f"Google Flights の通常の価格帯（¥{gf['low']:,}〜¥{gf['high']:,}）より安い")
 
                   # 履歴を更新（その日の最安値を保持）
                   day = history.setdefault(hkey, {})
@@ -316,32 +454,57 @@ jobs:
               place = f"{city}（{country}）" if country and cc != "JP" else city
               origin, ow = it.get("_origin", ORIGIN), it.get("_ow", False)
               kind = "片道" if ow else "往復"
+              dep, ret = (it.get("departure_at") or "")[:10], (it.get("return_at") or "")[:10]
               link = it.get("link") or ""
               if link.startswith("/"):
-                  url = "https://www.aviasales.com" + link
+                  avia_url = "https://www.aviasales.com" + link
               else:                                          # リンクが無いデータは検索結果ページを開く
-                  dep, ret = (it.get("departure_at") or "")[:10], (it.get("return_at") or "")[:10]
                   back = "" if ow else f"{ret[8:10]}{ret[5:7]}"
-                  url = f"https://www.aviasales.com/search/{origin}{dep[8:10]}{dep[5:7]}{dest}{back}1" if dep and (ow or ret) else None
-              fields = [
-                  {"name": "往路", "value": f"{fmt_date(it.get('departure_at'))}\n{it.get('origin_airport', '') + '→' + it.get('destination_airport', '') + '・' if it.get('origin_airport') else ''}{fmt_transfers(it.get('transfers'))}", "inline": True},
-              ]
+                  avia_url = f"https://www.aviasales.com/search/{origin}{dep[8:10]}{dep[5:7]}{dest}{back}1" if dep and (ow or ret) else None
+              google_url = gf_url(origin, dest, dep, ret or None) if dep and (ow or ret) else None
+              gf, avia = it.get("_gf"), it.get("_avia", it.get("_fare", it["price"]))
+              by_google = bool(gf and gf.get("price") and gf["price"] <= avia)   # Google Flights の方が安い（同額を含む）
+
+              if by_google:                                  # 便の情報も Google Flights のものを出す
+                  out_text = f"{fmt_date(dep)} {gf['time']}\n{gf['src']}→{gf['dst']}・{fmt_transfers(gf['stops'])}"
+                  back_text, airline = fmt_date(ret), gf["air"]
+              else:
+                  out_text = f"{fmt_date(it.get('departure_at'))}\n{it.get('origin_airport', '') + '→' + it.get('destination_airport', '') + '・' if it.get('origin_airport') else ''}{fmt_transfers(it.get('transfers'))}"
+                  back_text = f"{fmt_date(it.get('return_at'))}\n{fmt_transfers(it.get('return_transfers'))}"
+                  airline = f"{it.get('airline', '-')} {it.get('flight_number', '')}".strip()
+              fields = [{"name": "往路", "value": out_text, "inline": True}]
               if not ow:
-                  fields.append({"name": "復路", "value": f"{fmt_date(it.get('return_at'))}\n{fmt_transfers(it.get('return_transfers'))}", "inline": True})
-              fields.append({"name": "航空会社", "value": f"{it.get('airline', '-')} {it.get('flight_number', '')}".strip(), "inline": True})
+                  fields.append({"name": "復路", "value": back_text, "inline": True})
+              fields.append({"name": "航空会社", "value": airline, "inline": True})
               if origin == ORIGIN:
                   title = f"✈️ 東京 → {place}　{kind} ¥{int(it['price']):,}"
               else:
                   oname = cities.get(origin, (origin, ""))[0]
                   title = f"✈️ {oname}発 → {place}　{kind} 合計 ¥{int(it['price']):,}"
                   fields.append({"name": "内訳", "value": f"東京→{oname}（{kind}・国内線の最安目安） ¥{it['_extra']:,}\n{oname}発の運賃 ¥{it['_fare']:,}\n※国内線は別に予約。日付が合う便か確認してください", "inline": False})
+
+              # 同じ日付での Aviasales と Google Flights の価格（地方発は、その空港からの運賃どうしを比べる）
+              g_link = f"[Google Flights]({google_url})" if google_url else "Google Flights"
+              a_link = f"[Aviasales]({avia_url})" if avia_url else "Aviasales"
+              if by_google:
+                  compare = f"{g_link} ¥{gf['price']:,} ← 安い方\n{a_link} ¥{avia:,}"
+              elif gf and gf.get("price"):
+                  compare = f"{a_link} ¥{avia:,} ← 安い方\n{g_link} ¥{gf['price']:,}"
+                  if gf["price"] > avia * GF_STALE_RATE:
+                      compare += "\n⚠️ 差が大きいので、Aviasales の価格は古い可能性があります"
+              elif gf:
+                  compare = f"{a_link} ¥{avia:,}\n{g_link} にはこの日付の便が出ていません"
+              else:
+                  compare = f"{a_link} ¥{avia:,}\n{g_link} は未確認"
+              fields.append({"name": "価格の比較（同じ日付）", "value": compare, "inline": False})
               fields.append({"name": "通知理由", "value": "\n".join(reasons), "inline": False})
               embed = {
                   "title": title[:256],
                   "color": 0x2ECC71 if cc == "JP" else (0x9B59B6 if origin != ORIGIN else 0x3498DB),
                   "fields": fields,
-                  "footer": {"text": "価格はキャッシュ値です。予約前にリンク先で最新価格を確認してください。"},
+                  "footer": {"text": "価格は取得した時点のものです。予約前にリンク先で最新価格を確認してください。"},
               }
+              url = google_url if by_google else avia_url
               if url:
                   embed["url"] = url
               return embed
