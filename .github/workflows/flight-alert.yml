@@ -502,7 +502,7 @@ jobs:
                   "title": title[:256],
                   "color": 0x2ECC71 if cc == "JP" else (0x9B59B6 if origin != ORIGIN else 0x3498DB),
                   "fields": fields,
-                  "footer": {"text": "価格は取得した時点のものです。予約前にリンク先で最新価格を確認してください。"},
+                  "footer": {"text": "燃油サーチャージ・税込みの大人1名の価格です。預け荷物・座席指定・支払手数料は別。\n価格は取得した時点のものです。予約前にリンク先で最新価格を確認してください。"},
               }
               url = google_url if by_google else avia_url
               if url:
