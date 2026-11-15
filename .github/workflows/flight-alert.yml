@@ -15,7 +15,7 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 15       # API 呼び出し約100回 ＋ Google Flights の確認が最大40回
+    timeout-minutes: 15       # API 呼び出し約100回 ＋ Google Flights の確認が最大40回 ＋ 総当たり40回
     steps:
       - uses: actions/checkout@v4
 
@@ -75,7 +75,15 @@ jobs:
           GF_MAX_FETCH = 40              # 1回の実行で Google Flights を開く最大回数（1回 約2秒）
           GF_CACHE_HOURS = 6             # 同じ便・同じ日付を調べ直すまでの時間
           GF_STALE_RATE = 1.3            # Google Flights がこの倍率より高ければ「Aviasales の価格は古いかも」と注意を付ける
-          SALE_FEED = "https://www.traicy.com/category/sale/feed"  # トライシーの「セール・特別運賃」記事
+          # Google Flights を自分から総当たりで調べる（Aviasales に無い日付の安い便を拾う）。東京発・往復のみ
+          GF_SCAN_DESTS = "SEL PUS TPE HKG SHA BKK MNL CEB SGN SIN DPS HNL SYD CNS".split()
+          #                ソウル 釜山 台北 香港 上海 バンコク マニラ セブ ホーチミン シンガポール バリ ホノルル シドニー ケアンズ
+          GF_SCAN_NIGHTS = 7             # 滞在日数（出発の何日後に帰るか）
+          GF_SCAN_WEEKDAYS = (1, 5)      # 調べる出発曜日（0=月 … 6=日）。火曜発と土曜発
+          GF_SCAN_FROM_DAYS = 7          # 何日後の出発から調べるか
+          GF_SCAN_PER_RUN = 40           # 1回の実行で調べる件数（多くすると Google に止められやすくなる）
+          GF_SCAN_KEEP_HOURS = 8         # 調べた価格を何時間使うか（一周 約4.5時間より長くする）
+          SALE_FEED ="https://www.traicy.com/category/sale/feed"  # トライシーの「セール・特別運賃」記事
           SALE_NEED_PRICE = True         # 金額（○円）が書かれたセール記事だけ通知する
           SALE_KEEP_DAYS = 60            # 通知済み記事を何日覚えておくか
           # 海外のエラー運賃・激安情報（Travel-Dealz）。日本発の記事だけ通知する
@@ -83,6 +91,10 @@ jobs:
           JP_PLACES = r"(Tokyo|Haneda|Narita|Japan|Osaka|Kansai|Nagoya|Fukuoka|Sapporo|Okinawa|Naha)"
           DEAL_JP_RE = re.compile(rf"\b(from|ex)\s+{JP_PLACES}\b|\b{JP_PLACES}\b[^:]*↔|↔\s*{JP_PLACES}\b", re.I)  # 「from Tokyo」「Tokyo ↔ ○○」
           DEAL_HOT_RE = re.compile(r"error fare|mistake fare|glitch|\bbug\b", re.I)  # これが付いていたら目印を付ける
+          # 海外のエラー運賃・激安情報（Secret Flying）の「日本発」ページ。東京・大阪など日本発の記事だけが並ぶ
+          SF_URL = "https://www.secretflying.com/cheap-flights-from/japan/"
+          SF_RECENT_DAYS = 14            # 掲載日がこの日数以内の記事だけ通知する（ページには古い記事も並ぶため）
+          RATE_URL = "https://open.er-api.com/v6/latest/USD"   # ドル→円の目安換算用（取れなければドル表記のまま）
           # ===================================================
 
           API_URL = "https://api.travelpayouts.com/aviasales/v3/prices_for_dates"
@@ -270,6 +282,50 @@ jobs:
               print(f"Google Flights で確認: 候補 {len(wanted)} 件 / 今回調べた {done} 件 / 次回に回す {len(todo) - done} 件")
 
 
+          def gf_scan(state):
+              """GF_SCAN_DESTS × 出発日を、前回の続きから GF_SCAN_PER_RUN 件だけ Google Flights で調べる。
+              まだ新しい結果すべてを、Aviasales のデータと同じ形にして返す。"""
+              now = datetime.now(JST)
+              scans = state.setdefault("gf_scan", {})        # 出発地|行先|往路日|復路日 → 価格など
+              cache = state.setdefault("gf", {})
+              cut = (now - timedelta(hours=GF_SCAN_KEEP_HOURS)).isoformat()
+              for k in [k for k, v in scans.items() if v["at"] < cut]:
+                  del scans[k]
+              today = now.date()
+              days = [today + timedelta(days=n) for n in range(GF_SCAN_FROM_DAYS, MONTHS_AHEAD * 30)]
+              todo = [(d, dest) for d in days if d.weekday() in GF_SCAN_WEEKDAYS for dest in GF_SCAN_DESTS]
+              pos = state.get("gf_scan_pos", 0) % len(todo)
+              done = fails = 0
+              for i in range(min(GF_SCAN_PER_RUN, len(todo))):
+                  d, dest = todo[(pos + i) % len(todo)]
+                  dep, ret = d.isoformat(), (d + timedelta(days=GF_SCAN_NIGHTS)).isoformat()
+                  key = "|".join((ORIGIN, dest, dep, ret))
+                  try:
+                      scans[key] = cache[key] = {"at": now.isoformat(), **gf_search(ORIGIN, dest, dep, ret)}
+                      fails = 0
+                  except Exception as e:
+                      fails += 1
+                      print(f"[warn] Google Flights 総当たり（{ORIGIN}→{dest} {dep}）の取得に失敗: {e}")
+                  done += 1
+                  if fails >= 3:                             # 3回続けて失敗したら、今回はあきらめる
+                      break
+                  time.sleep(1)
+              state["gf_scan_pos"] = (pos + done - fails) % len(todo)   # 失敗した分は次回やり直す
+              print(f"Google Flights 総当たり: 全 {len(todo)} 件中 {pos + 1} 件目から {done} 件調べた / 手持ちの結果 {len(scans)} 件")
+
+              items = []
+              for key, v in scans.items():
+                  newer = cache.get(key)
+                  if newer and newer["at"] > v["at"]:        # あとから調べ直した価格があれば、そちらを使う
+                      v = newer
+                  if not v.get("price"):
+                      continue                               # その日付に便が無い
+                  origin, dest, dep, ret = key.split("|")
+                  items.append({"destination": dest, "price": v["price"], "departure_at": dep, "return_at": ret,
+                                "transfers": v.get("stops"), "_origin": origin, "_ow": False, "_scan": v})
+              return items
+
+
           def fetch_sales(state, feed=SALE_FEED, key="sales_seen", keep=None):
               """RSS から、まだ通知していない記事を返す。keep(title) が False の記事は捨てる。"""
               req = urllib.request.Request(feed, headers={"User-Agent": "Mozilla/5.0 (flight-alert/1.0)"})
@@ -295,6 +351,55 @@ jobs:
                       continue
                   new.append({"title": title, "url": link})
               return new
+
+
+          SF_MONTHS = {m: i + 1 for i, m in enumerate("Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split())}
+
+
+          def fetch_secretflying(state):
+              """Secret Flying の日本発ページから、まだ通知していない記事を返す。値段が変わった記事は新着として扱う。"""
+              import html
+              req = urllib.request.Request(SF_URL, headers={"User-Agent": GF_HEADERS["User-Agent"], "Accept-Language": "en"})
+              with urllib.request.urlopen(req, timeout=30) as res:
+                  page = res.read().decode("utf-8", "replace")
+              now = datetime.now(JST)
+              first = "sf_seen" not in state
+              seen = state.setdefault("sf_seen", {})
+              posts = []
+              for chunk in page.split("<article ")[1:]:
+                  m = re.search(r'<a href="(https://www\.secretflying\.com/posts/[^"]+)"[^>]*title="([^"]+)"', chunk)
+                  d = re.search(r'<time class="entry-date[^"]*">([A-Z][a-z]{2}) (\d{1,2}), (20\d\d)</time>', chunk)
+                  if not m or not d or d.group(1) not in SF_MONTHS:
+                      continue                                  # 広告など、記事ではない枠
+                  title = html.unescape(m.group(2)).strip()
+                  posted = datetime(int(d.group(3)), SF_MONTHS[d.group(1)], int(d.group(2)), tzinfo=JST)
+                  price = re.search(r"[$€£]\s?[\d,]+", title)
+                  hot = "error fare" in title.lower() or "error-fare-ef" in chunk.split(">", 1)[0]
+                  posts.append({"key": f"{m.group(1)}|{price.group(0) if price else ''}", "title": title, "url": m.group(1), "posted": posted, "hot": hot})
+              if not posts:
+                  raise RuntimeError("記事が1件も読めなかった（ページの形が変わった可能性）")
+              new = []
+              for p in posts:
+                  if p["key"] not in seen and not first and (now - p["posted"]).days <= SF_RECENT_DAYS:
+                      new.append(p)
+                  seen[p["key"]] = now.isoformat()              # ページに載っている間は覚えておく
+              cut = (now - timedelta(days=SALE_KEEP_DAYS)).isoformat()
+              for k in [k for k, t in seen.items() if t < cut]:
+                  del seen[k]
+              return new
+
+
+          def usd_to_jpy_text(title):
+              """タイトル中の「$247」を円の目安に直した文字列を返す。ドル表記が無い・レートが取れないときは空文字。"""
+              m = re.search(r"\$\s?([\d,]+)\s*(?:USD)?", title)
+              if not m or re.search(r"\b(CAD|AUD|NZD|SGD|HKD)\b", title):
+                  return ""
+              try:
+                  rate = float(http_get_json(RATE_URL)["rates"]["JPY"])
+              except Exception as e:
+                  print(f"[warn] 為替レートの取得に失敗: {e}")
+                  return ""
+              return f"約 ¥{round(int(m.group(1).replace(',', '')) * rate, -2):,.0f}（1ドル {rate:.0f}円で換算）"
 
 
           def load_state():
@@ -412,6 +517,8 @@ jobs:
                       f = min(int(cand["price"]), g["price"]) if g["price"] else int(cand["price"])
                       if gf is None or f < fare:                # 調べた便を優先し、その中でいちばん安い日付を選ぶ
                           it, gf, fare = cand, g, f
+                  if gf is None and it.get("_scan"):            # 総当たりで見つけた便は、そのときの結果を使う
+                      gf = it["_scan"]
                   it = dict(it)
                   price = fare + extra
                   it["_avia"], it["_gf"] = int(it["price"]), gf
@@ -486,7 +593,9 @@ jobs:
               # 同じ日付での Aviasales と Google Flights の価格（地方発は、その空港からの運賃どうしを比べる）
               g_link = f"[Google Flights]({google_url})" if google_url else "Google Flights"
               a_link = f"[Aviasales]({avia_url})" if avia_url else "Aviasales"
-              if by_google:
+              if it.get("_scan") and by_google:              # Aviasales には無く、Google Flights の総当たりで見つけた便
+                  compare = f"{g_link} ¥{gf['price']:,}（Google Flights を直接調べて見つけた便）\n{a_link} にはこの日付のデータがありません"
+              elif by_google:
                   compare = f"{g_link} ¥{gf['price']:,} ← 安い方\n{a_link} ¥{avia:,}"
               elif gf and gf.get("price"):
                   compare = f"{a_link} ¥{avia:,} ← 安い方\n{g_link} ¥{gf['price']:,}"
@@ -552,6 +661,11 @@ jobs:
                           items.extend(latest)
                       except Exception as e:                # 追加データなので失敗しても続行
                           print(f"[warn] 直近48時間の価格（{label}）の取得に失敗: {e}")
+              if GF_ENABLED and GF_SCAN_DESTS:
+                  try:
+                      items.extend(gf_scan(state))
+                  except Exception as e:                    # 追加データなので失敗しても続行
+                      print(f"[warn] Google Flights 総当たりに失敗: {e}")
               deals = pick_deals(items, state, cities)
               print(f"通知件数: {len(deals)}")
 
@@ -586,6 +700,20 @@ jobs:
                       post_discord(webhook, {"content": f"日本発の激安・エラー運賃情報が {len(deals_jp)} 件あります（Travel-Dealz）。", "embeds": embeds})
               except Exception as e:
                   print(f"[warn] 激安運賃記事の取得に失敗: {e}")
+
+              try:
+                  sf = fetch_secretflying(state)
+                  print(f"新着・日本発の激安/エラー運賃記事（Secret Flying）: {len(sf)}")
+                  if sf:
+                      embeds = []
+                      for p in sf[:10]:
+                          yen = usd_to_jpy_text(p["title"])
+                          embeds.append({"title": f"{'🚨 ' if p['hot'] else '💸 '}{p['title']}"[:256], "url": p["url"], "color": 0xE74C3C if p["hot"] else 0xF1C40F,
+                                         **({"description": yen} if yen else {}),
+                                         "footer": {"text": f"海外サイトの記事（{p['posted']:%m/%d} 掲載）。roundtrip = 往復。エラー運賃はすぐ消えるので早めに確認を。"}})
+                      post_discord(webhook, {"content": f"日本発の激安・エラー運賃情報が {len(sf)} 件あります（Secret Flying）。", "embeds": embeds})
+              except Exception as e:
+                  print(f"[warn] Secret Flying の取得に失敗: {e}")
 
               save_state(state)
 
